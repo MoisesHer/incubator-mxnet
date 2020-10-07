@@ -137,116 +137,146 @@ void SliceDimTwoCsrImpl<gpu>(const mxnet::TShape &begin, const mxnet::TShape &en
   });
 }
 
-constexpr size_t split_max_sections = 128;
+constexpr size_t size2activate_join_sectors = 32;
+constexpr size_t split_max_sections = 82;
 template <typename DType>
 struct split_tensor_data {
   size_t num_sections;
-  DType* outputs[split_max_sections];
-  size_t indices[split_max_sections];
   DType* inputs[1];
+  DType* outputs[split_max_sections];
+  size_t in_strides[split_max_sections];
+  size_t out_strides[split_max_sections];
+  size_t n_elements[split_max_sections];
+  size_t original_section_sizes[split_max_sections];
+  size_t accum_elems_block[split_max_sections];
 };
-    
-template <bool split_last_axis, typename LType, typename DType>
-__global__ void split_tensor_kernel(size_t input_size,
-                                    const split_tensor_data<DType> params,
-                                    size_t axis_size,
-                                    size_t last_dim,
-                                    size_t trailing) {
+   
+template <bool several_sections_per_block, typename LType, typename DType>
+__global__ void split_tensor_kernel(const split_tensor_data<DType> params,
+                                    size_t total_elems_split_dim,
+                                    size_t n_blocks_split_dim,
+                                    size_t n_sections_block,
+                                    size_t leading_size,
+                                    size_t n_iters_leading_dims) {
   const int entries_per_load = sizeof(LType)/sizeof(DType);
-  /*extern __shared__ int position2section[];
-  //initialize position2section
-  if (threadIdx.x==0) {
-    size_t section = 0;
-    for (size_t i=0; i<params.num_sections; ++i) {
-      size_t start = params.indices[i];
-      size_t end = params.indices[i+1];
-      if (split_last_axis) {
-        start = entries_per_load > 0 ? start / entries_per_load: start;
-        end = entries_per_load > 0 ? end / entries_per_load: end;
-      }
-      for (int j=start; j<end; ++j) {
-        position2section[j] = section;
-      }
-      section++;
-    }
-  }
-  __syncthreads();*/
+  extern __shared__ int sharedmem[];
+  DType* elements =  reinterpret_cast<DType*>(sharedmem);
 
-  // silence warning division by 0
-  const int axis_size_aligned =  entries_per_load > 0 ? axis_size / entries_per_load : axis_size;
-  const int last_dim_aligned =  entries_per_load > 0 ? last_dim / entries_per_load : 0;
-  const LType* in_aligned = reinterpret_cast<const LType*>(params.inputs[0]);
-  size_t input_offset = blockIdx.x * last_dim_aligned;
-  if (split_last_axis) {
-    for (index_t i = threadIdx.x; i < axis_size_aligned; i += blockDim.x) {
-      LType input_data = in_aligned[input_offset+i];
-      size_t section = 0;
-      size_t section_size = params.indices[1] - params.indices[0];
-      for (; section < params.num_sections && params.indices[section+1] <= i*entries_per_load;) {
-        section++;
-        section_size = params.indices[section+1] - params.indices[section];
+  if (several_sections_per_block) {
+    // M sections, N blocks, ignores LoadType
+    // assumes (elements assigned to block) < (threads within block)
+    size_t start_sector = (blockIdx.x % n_blocks_split_dim) * n_sections_block;
+    size_t start_pos_in = params.in_strides[start_sector];
+    size_t last_sector = std::min(start_sector + n_sections_block - 1, params.num_sections - 1);
+    size_t end_pos_in = params.in_strides[last_sector] + params.n_elements[last_sector] - 1;
+    size_t n_elements = end_pos_in - start_pos_in + 1;
+
+    // Binary search to find sector of each thread
+    size_t lower = start_sector;
+    size_t upper = last_sector;
+    while (lower < upper) {
+      size_t mid = (lower + upper + 1) / 2;
+      if (threadIdx.x >= params.accum_elems_block[mid])
+        lower = mid;
+      else
+        upper = mid - 1;
+    }
+    size_t my_sector = upper;
+    size_t n_elems_my_sector = params.n_elements[my_sector];
+
+    size_t leading_offset_in = size_t(blockIdx.x / n_blocks_split_dim) *
+                               total_elems_split_dim * n_iters_leading_dims;
+    size_t n_iters = n_iters_leading_dims;
+    if ((size_t(blockIdx.x / n_blocks_split_dim) + 1) * n_iters_leading_dims >
+        leading_size) {
+      n_iters = leading_size - size_t(blockIdx.x / n_blocks_split_dim) *
+                n_iters_leading_dims;
+    }                       
+    // read elements for several sectors into shared, iterating over split dim
+    for (size_t iter = 0; iter < n_iters; ++iter) {
+      if (threadIdx.x < n_elements) {
+        // elements in shared follow pattern: Section-0{0..N}, Section-1{0..N}, etc..
+        size_t pos_in_shared = ((my_sector - start_sector) * size2activate_join_sectors) +
+                               (iter * n_elems_my_sector) +
+                                threadIdx.x - params.accum_elems_block[my_sector];
+        elements[pos_in_shared] = params.inputs[0][leading_offset_in + start_pos_in +
+                                                   iter * total_elems_split_dim +
+                                                   threadIdx.x];
       }
-      //size_t section = position2section[i];
-      //size_t section_size = params.indices[section+1] - params.indices[section];
-      LType* out_aligned = reinterpret_cast<LType*>(params.outputs[section]);
-      // silence warning division by 0
-      size_t section_size_aligned = entries_per_load > 0 ? section_size / entries_per_load :
-                                                         section_size;
-      size_t index_aligned = entries_per_load > 0 ? params.indices[section] / entries_per_load :
-                                                    params.indices[section];
-      size_t output_position = blockIdx.x * section_size_aligned + i - index_aligned;
-      out_aligned[output_position] = input_data;
     }
+    // write into each section
+    size_t offset_shared = 0;
+    for (size_t sec = start_sector; sec <= last_sector; ++sec) {
+      size_t leading_offset_out = size_t(blockIdx.x / n_blocks_split_dim) *
+                                  n_iters_leading_dims * params.original_section_sizes[sec];
+      for (size_t i = threadIdx.x; i < params.n_elements[sec] * n_iters; i += blockDim.x) {
+        size_t offset, offset_remaining_elems_sector;
+        if (params.n_elements[sec] < params.original_section_sizes[sec]) {
+          // if there are remanining elems for this sector on this axis 
+          // (because one section was subdivided further): then can be uncoalesced accesses
+          // this only happens with irregular sections sizes & small sections
+          offset_remaining_elems_sector = size_t(i / params.n_elements[sec]) *
+                                          params.original_section_sizes[sec];
+          offset = size_t(i % params.n_elements[sec]);
+        } else {
+          offset_remaining_elems_sector = 0;
+          offset = i;
+        }
+        params.outputs[sec][leading_offset_out + params.out_strides[sec] +
+                            offset_remaining_elems_sector + offset] =
+            elements[offset_shared + i];
+          
+      }
+      offset_shared += size2activate_join_sectors;
+    }
+    
   } else {
-    size_t position_in_axis = (blockIdx.x / trailing) % axis_size;
-    size_t section = 0;
-    size_t section_size = params.indices[1] - params.indices[0];
-    for (; section < params.num_sections && params.indices[section+1] <= position_in_axis;) {
-      section++;
-      section_size = params.indices[section+1] - params.indices[section];
-    }
-    //size_t section = position2section[position_in_axis];
-    //size_t section_size = params.indices[section+1] - params.indices[section];
-    LType* out_aligned = reinterpret_cast<LType*>(params.outputs[section]);
-    size_t head_id = blockIdx.x / (trailing * axis_size);
-    size_t head_module = blockIdx.x % (trailing * axis_size);
-    size_t offset_head_sector = head_module - (params.indices[section] * trailing);
-    size_t position_in_sector = (head_id * section_size * trailing +
-                                 offset_head_sector) * last_dim_aligned;
-    for (index_t i = threadIdx.x; i < last_dim_aligned; i += blockDim.x) {
-      LType input_data = in_aligned[input_offset + i];
-      out_aligned[position_in_sector + i] = input_data;
+    // 1 section, N blocks
+    size_t section_id = blockIdx.x % params.num_sections;
+    size_t n_elements =  entries_per_load > 0 ?
+                         params.n_elements[section_id] / entries_per_load : 0;
+    const LType* in_aligned = reinterpret_cast<const LType*>(params.inputs[0]);
+    LType* out_aligned = reinterpret_cast<LType*>(params.outputs[section_id]);
+    size_t leading_offset_in = entries_per_load ?
+                               int(blockIdx.x / params.num_sections) *
+                               total_elems_split_dim / entries_per_load : 0;
+    size_t leading_offset_out = entries_per_load ? 
+                                int(blockIdx.x / params.num_sections) *
+                                params.original_section_sizes[section_id] / entries_per_load : 0;
+    for (size_t i = threadIdx.x; i < n_elements; i += blockDim.x) {
+      size_t offset_in = entries_per_load ?
+                         params.in_strides[section_id] / entries_per_load + i : 0;
+      size_t offset_out = entries_per_load ?
+                          params.out_strides[section_id] / entries_per_load + i : 0;
+      LType e = in_aligned[leading_offset_in + offset_in];
+      out_aligned[leading_offset_out + offset_out] = e;
     }
   }
 }
 
 template <typename DType>
-int get_load_type_split(size_t last_dim,
-                        bool splitting_last_axis,
-                        std::vector<size_t> indices) {
+int get_load_type_split(const split_tensor_data<DType> params) {
   using namespace mshadow;
   int sectors_largest_multiple = 8;
-  if(splitting_last_axis) {
-    for(size_t i = 0; i < indices.size()-1; ++i){
-      size_t size_sector = indices[i+1] - indices[i];
-      if (size_sector * sizeof(DType) % 8)
-        sectors_largest_multiple = std::min(sectors_largest_multiple, 4);
-      if (size_sector * sizeof(DType) % 4)
-        sectors_largest_multiple = std::min(sectors_largest_multiple, 2);
-      if (size_sector * sizeof(DType) % 2)
-        sectors_largest_multiple = std::min(sectors_largest_multiple, 1);
-    }
+  for (size_t i = 0; i < params.num_sections; ++i) {
+    if (params.n_elements[i] * sizeof(DType) % 8)
+      sectors_largest_multiple = std::min(sectors_largest_multiple, 4);
+    if (params.n_elements[i] * sizeof(DType) % 4)
+      sectors_largest_multiple = std::min(sectors_largest_multiple, 2);
+    if (params.n_elements[i] * sizeof(DType) % 2)
+      sectors_largest_multiple = std::min(sectors_largest_multiple, 1);
   }
-  if (last_dim * sizeof(DType) % 8 == 0 && sectors_largest_multiple == 8) {
+  if (sectors_largest_multiple == 8) {
     return kFloat64;
-  } else if (last_dim * sizeof(DType) % 4 == 0 && sectors_largest_multiple >= 4) {
+  } else if (sectors_largest_multiple >= 4) {
     return kFloat32;
-  } else if (last_dim * sizeof(DType) % 2 == 0 && sectors_largest_multiple >= 2) {
+  } else if (sectors_largest_multiple >= 2) {
     return kFloat16;
   } else {
     return kUint8;
   }
-}
+  return kUint8;
+}    
 
 template<>
 inline void SplitOpForwardImpl<gpu>(const nnvm::NodeAttrs& attrs,
@@ -266,92 +296,133 @@ inline void SplitOpForwardImpl<gpu>(const nnvm::NodeAttrs& attrs,
   const mxnet::TShape split_pts =
     (param.sections > 0) ? GetSplitIndices(ishape, real_axis, param.sections) : param.indices;
   std::vector<size_t> indices;
+  
   for (const auto& split_pos : split_pts) {
     indices.push_back(split_pos);
   }
   if (param.sections == 0) {
     indices.push_back(ishape[real_axis]);
   }
-  size_t axis_size = input_data.shape_[real_axis];
+  int original_n_sections = indices.size() - 1;
 
-  if (outputs.size() > split_max_sections) {
-    size_t trailing = 1;
-    for (int i = real_axis + 1; i < input_data.ndim(); ++i) {
-      trailing *= input_data.shape_[i];
+  size_t tail_size = 1;
+  for (int i = real_axis + 1; i < input_data.ndim(); ++i) {
+    tail_size *= input_data.shape_[i];
+  }
+  size_t leading_size = 1;
+  for (int i = 0; i < real_axis; ++i) {
+    leading_size *= input_data.shape_[i];
+  }
+
+  size_t smallest_section_size = (indices[1] - indices[0]) * tail_size;
+  for (int i=0; i < (indices.size() -1); ++i) {
+    size_t section_size = (indices[i+1] - indices[i]) * tail_size;
+    if (section_size < smallest_section_size)
+      smallest_section_size = section_size;
+  }
+  
+  MSHADOW_TYPE_SWITCH(input_data.type_flag_, DType, {
+    size_t global_section_size = smallest_section_size;
+    if (leading_size * original_n_sections < 512) {
+      // force smaller (limit 128) sections to increase number of blocks
+      global_section_size = std::min<size_t>(128, global_section_size);
     }
-    size_t workspace_size = 0;
-    workspace_size += indices.size() * sizeof(size_t);
-    MSHADOW_TYPE_SWITCH(input_data.type_flag_, DType, {
-      std::vector<DType*> output_data;
-      for (const TBlob& data : outputs) {
-        output_data.push_back(data.dptr<DType>());
+    size_t block_size = size_t((smallest_section_size + 32 - 1) / 32) * 32;
+    block_size = std::min<size_t>(512, block_size);
+
+    size_t n_sections_block = 1;
+    if (global_section_size < size2activate_join_sectors) {
+      // compute several sections with same block, iterate over leading dims
+      n_sections_block = size_t(size2activate_join_sectors / smallest_section_size); 
+      block_size = size2activate_join_sectors;
+    }
+
+    // redefine sections to improve parallelism   
+    std::vector<DType*> new_outputs;
+    std::vector<size_t> out_strides;
+    std::vector<size_t> in_strides;
+    std::vector<size_t> n_elements;
+    std::vector<size_t> original_section_sizes;
+    std::vector<size_t> accum_elems_block;
+
+    size_t new_n_sections = 0;
+    size_t accum_size_split_dim = 0;
+    size_t accum_elems = 0;
+    for (int i=0; i < original_n_sections; ++i) {
+      size_t this_section_size = (indices[i+1] - indices[i]) * tail_size;
+      if (this_section_size > global_section_size) {
+        // split farther
+        for (int j=0; j<this_section_size; j+=global_section_size) {
+          new_outputs.push_back(outputs[i].dptr<DType>());
+          out_strides.push_back(j);
+          in_strides.push_back(accum_size_split_dim);
+          size_t remaining_elemts = this_section_size - j;
+          size_t n_elems = std::min(remaining_elemts, global_section_size);
+          n_elements.push_back(n_elems);
+          original_section_sizes.push_back(this_section_size);
+          accum_elems_block.push_back(accum_elems);
+          new_n_sections++;
+          accum_size_split_dim += n_elems;
+          if (new_n_sections % n_sections_block == 0)
+            accum_elems = 0;
+          else
+            accum_elems += n_elems;
+        }
+      } else {
+        new_outputs.push_back(outputs[i].dptr<DType>());
+        out_strides.push_back(0);
+        in_strides.push_back(accum_size_split_dim);
+        n_elements.push_back(this_section_size);
+        original_section_sizes.push_back(this_section_size);
+        accum_elems_block.push_back(accum_elems);
+        new_n_sections++;
+        accum_size_split_dim += this_section_size;
+        if (new_n_sections % n_sections_block == 0)
+            accum_elems = 0;
+        else
+            accum_elems += this_section_size;
       }
-      workspace_size += output_data.size() * sizeof(DType*);
-      Tensor<gpu, 1, char> workspace =
-        ctx.requested[0].get_space_typed<gpu, 1, char>(Shape1(workspace_size), s);
-      Tensor<cpu, 1, size_t> indices_cpu_tensor(indices.data(), Shape1(indices.size()));
-      Tensor<gpu, 1, size_t> indices_xpu_tensor(
-        reinterpret_cast<size_t*>(workspace.dptr_), Shape1(indices.size()));
-      Tensor<cpu, 1, DType*> ptrs_cpu_tensor(output_data.data(), Shape1(output_data.size()));
-      Tensor<gpu, 1, DType*> ptrs_xpu_tensor(
-        reinterpret_cast<DType**>(workspace.dptr_ + indices.size() * sizeof(size_t)),
-        Shape1(output_data.size()));
-      mshadow::Copy(indices_xpu_tensor, indices_cpu_tensor, s);
-      mshadow::Copy(ptrs_xpu_tensor, ptrs_cpu_tensor, s);
-      Kernel<SplitKernel, gpu>::Launch(
-        s, input_data.Size(), input_data.dptr<DType>(), ptrs_xpu_tensor.dptr_,
-        indices_xpu_tensor.dptr_, indices.size() - 1, axis_size, trailing);
-    });
-
-  } else {
-    size_t trailing = 1;
-    // trailing ignores last dimension
-    for (int i = real_axis + 1; i < input_data.ndim()-1; ++i) {
-      trailing *= input_data.shape_[i];
     }
-    bool splitting_last_axis = (real_axis == inputs[0].ndim()-1);
-    size_t last_dim = input_data.shape_[input_data.ndim()-1];
-    MSHADOW_TYPE_SWITCH(input_data.type_flag_, DType, {
-      // load type: we need to check that last axis size is multiple of ltype 
-      // and if splitting_last_axis, all sector sizes as well 
-      int ltype = get_load_type_split<DType>(last_dim, splitting_last_axis, indices);
+    n_sections_block = std::min<size_t>(n_sections_block, new_n_sections);
+    size_t n_iters_leading_dims = n_sections_block;
+
+    for(int processed_sections=0; processed_sections<new_n_sections; processed_sections+=split_max_sections) {    
+      size_t remaining_sections = new_n_sections - processed_sections;
       // set parameters
       split_tensor_data<DType> params{};
-      params.num_sections = indices.size() - 1;
+      params.num_sections = std::min(remaining_sections, split_max_sections);
       params.inputs[0] = input_data.dptr<DType>();
-      params.indices[0] = indices[0]; 
       for (int i=0; i < params.num_sections; i++) {
-        params.outputs[i] = outputs[i].dptr<DType>();
-        params.indices[i+1] = indices[i+1];
+        params.outputs[i] = new_outputs[processed_sections + i];
+        params.in_strides[i] = in_strides[processed_sections + i];
+        params.out_strides[i] = out_strides[processed_sections + i];
+        params.n_elements[i] = n_elements[processed_sections + i];
+        params.original_section_sizes[i] = original_section_sizes[processed_sections + i];
+        params.accum_elems_block[i] = accum_elems_block[processed_sections + i];
       }
-      
+      // load type: we need to check that all sector sizes are multiple of ltype 
+      int ltype = get_load_type_split<DType>(params);
       MXNET_LOAD_TYPE_SWITCH(ltype, LType, {
         CHECK_LE(sizeof(DType), sizeof(LType));
-        int nblocks = 1;
-        // each block of threads computes one instance of last dimension
-        for (int i = 0 ; i < input_data.ndim()-1; ++i) {
-          nblocks *= input_data.shape_[i];
-        }
-        const int entries_per_load = sizeof(LType)/sizeof(DType);
-        int block_size = 32;
-        int max_threads_block = 512;
-        size_t block_n_elems = entries_per_load > 0 ? (last_dim/entries_per_load): 0;
-        while (block_size < block_n_elems && (block_size < max_threads_block))
-          block_size += 32;
-        //size_t required_shared = last_dim * sizeof(size_t) / entries_per_load;
-        size_t required_shared = 0;
-        if (splitting_last_axis) {
-          split_tensor_kernel<true, LType><<<nblocks, block_size,
-                              required_shared, s->stream_>>>
-            (input_data.Size(), params, axis_size, last_dim, trailing);
+        size_t blocks_split_dim = (params.num_sections + n_sections_block - 1) / n_sections_block;
+        size_t blocks_leading_dim = (leading_size + n_iters_leading_dims - 1) / n_iters_leading_dims;
+        size_t n_blocks =  blocks_leading_dim * blocks_split_dim;
+        size_t amount_shared_mem = 0;
+        if (n_sections_block > 1) {
+          amount_shared_mem = n_sections_block * size2activate_join_sectors * sizeof(DType);
+          printf("V0 Launching %lu blocks with %lu threads Shared %lu global_section_size %lu\n", n_blocks, block_size, amount_shared_mem, global_section_size);
+          split_tensor_kernel<true, LType><<<n_blocks, block_size, amount_shared_mem, s->stream_>>>
+                (params, accum_size_split_dim, blocks_split_dim, n_sections_block,
+                 leading_size, n_iters_leading_dims);
         } else {
-          split_tensor_kernel<false, LType><<<nblocks, block_size,
-                              required_shared, s->stream_>>>
-            (input_data.Size(), params, axis_size, last_dim, trailing);
+          printf("V1 Launching %lu blocks with %lu threads Shared %lu global_section_size\n", n_blocks, block_size, amount_shared_mem, global_section_size);
+          split_tensor_kernel<false, LType><<<n_blocks, block_size, amount_shared_mem, s->stream_>>>
+                (params, accum_size_split_dim, blocks_split_dim, n_sections_block,
+                 leading_size, n_iters_leading_dims);
         }
       });
-    }); 
-  }
+    }   
+  }); 
 }
 
 NNVM_REGISTER_OP(Reshape)
