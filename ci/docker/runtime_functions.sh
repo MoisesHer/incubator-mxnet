@@ -1191,12 +1191,8 @@ build_docs() {
 
     # copy the full site for this version to versions folder
     mkdir -p html/versions/master
-    for f in 404.html api assets community feed.xml get_started index.html; do
+    for f in 404.html api assets blog community ecosystem features feed.xml get_started index.html; do
         cp -r html/$f html/versions/master/
-    done
-
-    for f in blog ecosystem features; do
-        cp -r html/pages/$f html/versions/master/
     done
 
     # clean up temp files
@@ -1311,13 +1307,14 @@ cd_pypi_publish() {
 
 cd_s3_publish() {
     set -ex
-    pip3 install --user awscli
+    pip3 install --upgrade --user awscli
     filepath=$(readlink -f wheel_build/dist/*.whl)
     filename=$(basename $filepath)
     variant=$(echo $filename | cut -d'-' -f1 | cut -d'_' -f2 -s)
     if [ -z "${variant}" ]; then
         variant="cpu"
     fi
+    export PATH=/usr/local/bin:$PATH
     aws s3 cp ${filepath} s3://apache-mxnet/dist/python/${variant}/${filename} --grants read=uri=http://acs.amazonaws.com/groups/global/AllUsers full=id=43f628fab72838a4f0b929d7f1993b14411f4b0294b011261bc6bd3e950a6822
 }
 
